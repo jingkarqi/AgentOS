@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use sqlx::{FromRow, Sqlite, SqlitePool, Transaction};
+use sqlx::{Executor, FromRow, Sqlite, SqlitePool, Transaction};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -36,7 +36,7 @@ pub struct NewCheckpointRecord {
 pub struct CheckpointStore;
 
 impl CheckpointStore {
-    pub async fn record_placeholder(
+    pub async fn record(
         &self,
         tx: &mut Transaction<'_, Sqlite>,
         record: NewCheckpointRecord,
@@ -84,21 +84,110 @@ impl CheckpointStore {
         pool: &SqlitePool,
         task_id: Uuid,
     ) -> Result<Option<CheckpointRecord>> {
-        let row = sqlx::query_as::<_, CheckpointRow>(
-            r#"
-            SELECT checkpoint_id, task_id, state_version_ref, event_sequence_number, status, created_at, created_by, payload
-            FROM checkpoints
-            WHERE task_id = ?
-            ORDER BY event_sequence_number DESC
-            LIMIT 1
-            "#,
-        )
-        .bind(task_id.to_string())
-        .fetch_optional(pool)
-        .await?;
-
-        row.map(CheckpointRow::into_checkpoint).transpose()
+        fetch_latest_checkpoint_row(pool, task_id)
+            .await?
+            .map(CheckpointRow::into_checkpoint)
+            .transpose()
     }
+
+    pub async fn get_latest_for_task_in<'e, E>(
+        &self,
+        executor: E,
+        task_id: Uuid,
+    ) -> Result<Option<CheckpointRecord>>
+    where
+        E: Executor<'e, Database = Sqlite>,
+    {
+        fetch_latest_checkpoint_row(executor, task_id)
+            .await?
+            .map(CheckpointRow::into_checkpoint)
+            .transpose()
+    }
+
+    pub async fn get_by_id_for_task<'e, E>(
+        &self,
+        executor: E,
+        task_id: Uuid,
+        checkpoint_id: Uuid,
+    ) -> Result<Option<CheckpointRecord>>
+    where
+        E: Executor<'e, Database = Sqlite>,
+    {
+        fetch_checkpoint_row_by_id(executor, task_id, checkpoint_id)
+            .await?
+            .map(CheckpointRow::into_checkpoint)
+            .transpose()
+    }
+}
+
+async fn fetch_latest_checkpoint_row<'e, E>(
+    executor: E,
+    task_id: Uuid,
+) -> Result<Option<CheckpointRow>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query_as::<_, CheckpointRow>(
+        r#"
+        SELECT
+            c.checkpoint_id,
+            c.task_id,
+            c.state_version_ref,
+            c.event_sequence_number,
+            c.status,
+            c.created_at,
+            c.created_by,
+            c.payload
+        FROM checkpoints c
+        INNER JOIN task_state_versions s
+            ON s.state_version_id = c.state_version_ref
+           AND s.task_id = c.task_id
+        WHERE c.task_id = ?
+        ORDER BY c.event_sequence_number DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id.to_string())
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row)
+}
+
+async fn fetch_checkpoint_row_by_id<'e, E>(
+    executor: E,
+    task_id: Uuid,
+    checkpoint_id: Uuid,
+) -> Result<Option<CheckpointRow>>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
+    let row = sqlx::query_as::<_, CheckpointRow>(
+        r#"
+        SELECT
+            c.checkpoint_id,
+            c.task_id,
+            c.state_version_ref,
+            c.event_sequence_number,
+            c.status,
+            c.created_at,
+            c.created_by,
+            c.payload
+        FROM checkpoints c
+        INNER JOIN task_state_versions s
+            ON s.state_version_id = c.state_version_ref
+           AND s.task_id = c.task_id
+        WHERE c.task_id = ?
+          AND c.checkpoint_id = ?
+        LIMIT 1
+        "#,
+    )
+    .bind(task_id.to_string())
+    .bind(checkpoint_id.to_string())
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row)
 }
 
 #[derive(Debug, FromRow)]

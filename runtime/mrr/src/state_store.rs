@@ -99,6 +99,17 @@ impl StateStore {
         pool: &SqlitePool,
         state_version_id: Uuid,
     ) -> Result<TaskStateVersion> {
+        self.get_by_ref_in(pool, state_version_id).await
+    }
+
+    pub async fn get_by_ref_in<'e, E>(
+        &self,
+        executor: E,
+        state_version_id: Uuid,
+    ) -> Result<TaskStateVersion>
+    where
+        E: sqlx::Executor<'e, Database = Sqlite>,
+    {
         let row = sqlx::query_as::<_, StateVersionRow>(
             r#"
             SELECT state_version_id, task_id, version_number, status, payload, created_at, created_by
@@ -107,7 +118,7 @@ impl StateStore {
             "#,
         )
         .bind(state_version_id.to_string())
-        .fetch_one(pool)
+        .fetch_one(executor)
         .await?;
 
         row.into_state_version()

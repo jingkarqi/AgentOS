@@ -15,6 +15,12 @@ pub enum RuntimeError {
     TaskNotFound { task_id: Uuid },
     #[error("principal {principal_id} not found")]
     PrincipalNotFound { principal_id: Uuid },
+    #[error("task {task_id} has no checkpoint to restore")]
+    NoCheckpointForTask { task_id: Uuid },
+    #[error("checkpoint {checkpoint_id} not found for task {task_id}")]
+    CheckpointNotFound { task_id: Uuid, checkpoint_id: Uuid },
+    #[error("principal {principal_id} is not authorized to mutate task {task_id}")]
+    UnauthorizedTaskAction { task_id: Uuid, principal_id: Uuid },
     #[error("invalid task transition for {task_id}: {from_status} -> {to_status}")]
     InvalidTransition {
         task_id: Uuid,
