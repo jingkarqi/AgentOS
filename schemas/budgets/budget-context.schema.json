@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentos.dev/schemas/budgets/budget-context.schema.json",
+  "title": "AgentOS Budget Context v0.1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["budget_context_id", "unit", "limit", "spent", "scope", "updated_at"],
+  "properties": {
+    "budget_context_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "unit": {
+      "type": "string",
+      "minLength": 1
+    },
+    "limit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount"],
+      "properties": {
+        "amount": { "type": "number", "minimum": 0 },
+        "soft_amount": { "type": "number", "minimum": 0 }
+      }
+    },
+    "spent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["amount"],
+      "properties": {
+        "amount": { "type": "number", "minimum": 0 },
+        "as_of": { "type": "string", "format": "date-time" }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "tenant_id": { "type": "string", "minLength": 1 },
+        "principal_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 }
+      },
+      "anyOf": [
+        { "required": ["tenant_id"] },
+        { "required": ["principal_id"] },
+        { "required": ["task_id"] }
+      ]
+    },
+    "window": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind"],
+      "properties": {
+        "kind": { "type": "string", "enum": ["lifetime", "rolling", "calendar"] },
+        "duration_ms": { "type": "integer", "minimum": 1 },
+        "reset_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "metadata": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+}
