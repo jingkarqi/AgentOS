@@ -1,0 +1,5 @@
+# Rust build artifacts
+/runtime/mrr/target/
+
+# Windows alternate data stream artifacts
+*:Zone.Identifier
