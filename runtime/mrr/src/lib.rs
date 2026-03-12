@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod capability;
 pub mod checkpoint_store;
 pub mod clock;
 pub mod control_signal;
@@ -11,6 +12,13 @@ pub mod state_store;
 pub mod task;
 pub mod task_manager;
 
+pub use capability::{
+    CapabilityCallRecord, CapabilityCallStatus, CapabilityCallStore, CapabilityContract,
+    CapabilityDispatcher, CapabilityExecutionResult, CapabilityHandler,
+    CapabilityInvocationContext, CapabilityOutcome, CapabilityRegistry, CapabilityStatus,
+    CostClass, EffectClass, IdempotencyClass, InvokeCapabilityCommand, RegisterCapabilityCommand,
+    RetrySafety, SideEffectSummary, TimeoutClass, TrustLevel,
+};
 pub use checkpoint_store::{CheckpointRecord, CheckpointStore};
 pub use clock::{
     Clock, DeterministicIdGenerator, FixedClock, IdGenerator, RandomIdGenerator, SystemClock,

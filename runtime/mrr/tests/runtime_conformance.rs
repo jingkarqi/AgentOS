@@ -1383,6 +1383,7 @@ async fn control_signal_terminate_rejects_pre_start_tasks() {
 
 #[tokio::test]
 async fn cts_22_require_approval_waits_for_approve_control_signal() {
+async fn cts_22_require_approval_waits_for_approve_control_signal() {
     let harness = setup_harness().await;
     let approver_principal_id = Uuid::from_u128(2);
     create_active_principal(&harness, approver_principal_id, "Approver").await;
@@ -1509,6 +1510,172 @@ async fn cts_22_require_approval_waits_for_approve_control_signal() {
     assert!(events
         .iter()
         .all(|event| event.event_family != EventFamily::Capability));
+
+    let policy_required = &events[3];
+    let awaiting_control = &events[4];
+    let signal_received = &events[5];
+    let control_approved = &events[6];
+    let signal_applied = &events[7];
+
+    assert_eq!(policy_required.event_family, EventFamily::Policy);
+    assert_eq!(policy_required.payload["approval_gate_id"], "gate-1");
+    assert_eq!(policy_required.payload["blocked_call_id"], "call-1");
+    assert_eq!(signal_received.payload["approval_gate_id"], "gate-1");
+    assert_eq!(signal_received.payload["blocked_call_id"], "call-1");
+    assert_eq!(
+        control_approved.payload["details"]["approval_gate_id"],
+        "gate-1"
+    );
+    assert_eq!(
+        control_approved.payload["details"]["blocked_call_id"],
+        "call-1"
+    );
+    assert_eq!(signal_applied.payload["approval_gate_id"], "gate-1");
+    assert_eq!(signal_applied.payload["blocked_call_id"], "call-1");
+    assert_eq!(signal_applied.payload["status_after"], "running");
+    assert_eq!(
+        policy_required.correlation_id,
+        awaiting_control.correlation_id
+    );
+    assert_eq!(
+        signal_received.correlation_id,
+        control_approved.correlation_id
+    );
+    assert_eq!(
+        control_approved.correlation_id,
+        signal_applied.correlation_id
+    );
+    assert_eq!(
+        control_approved.causation_event_id,
+        Some(signal_received.event_id)
+    );
+    assert_eq!(
+        signal_applied.causation_event_id,
+        Some(signal_received.event_id)
+    );
+    assert!(events
+        .iter()
+        .all(|event| event.event_family != EventFamily::Capability));
+}
+
+#[tokio::test]
+async fn cts_22_deny_control_signal_blocks_execution_and_is_auditable() {
+async fn cts_22_same_principal_cannot_self_approve_waiting_task() {
+    let harness = setup_harness().await;
+    let task_id = create_task(&harness, "approval-self-approve").await;
+
+    harness
+        .manager
+        .start_task(task_id, actor(harness.owner_principal_id))
+        .await
+        .expect("start should succeed");
+    harness
+        .manager
+        .require_approval(
+            task_id,
+            actor(harness.owner_principal_id),
+            RequireApprovalCommand {
+                approval_gate_id: "gate-self".to_owned(),
+                blocked_call_id: Some("call-self".to_owned()),
+                details: json!({"capability_id": "C2"}),
+            },
+        )
+        .await
+        .expect("approval gate should be created");
+
+    let signal = harness
+        .manager
+        .submit_control_signal(
+            task_id,
+            actor(harness.owner_principal_id),
+            SubmitControlSignalCommand {
+                signal_type: ControlSignalType::Approve,
+                payload: json!({
+                    "approval_gate_id": "gate-self",
+                    "blocked_call_id": "call-self",
+                }),
+            },
+        )
+        .await
+        .expect("self approval should be audited and rejected");
+    assert_eq!(signal.status, ControlSignalStatus::Rejected);
+
+    let task = harness
+        .manager
+        .get_task(task_id)
+        .await
+        .expect("task should remain queryable");
+    assert_eq!(task.status, TaskStatus::WaitingOnControl);
+
+    let events = harness
+        .manager
+        .list_events_by_task(task_id)
+        .await
+        .expect("events should load");
+    assert_eq!(
+        events
+            .last()
+            .expect("rejection event should exist")
+            .event_type,
+        "control.signal.rejected"
+    );
+    assert_eq!(
+        events.last().expect("rejection event should exist").payload["reason_code"],
+        "approval_requires_distinct_principal"
+    );
+}
+
+#[tokio::test]
+async fn cts_22_approve_accepts_blocked_call_id_without_gate_id() {
+    let harness = setup_harness().await;
+    let approver_principal_id = Uuid::from_u128(2);
+    create_active_principal(&harness, approver_principal_id, "Approver").await;
+
+    let task_id = create_task(&harness, "approval-by-call-id").await;
+    harness
+        .manager
+        .start_task(task_id, actor(harness.owner_principal_id))
+        .await
+        .expect("start should succeed");
+    harness
+        .manager
+        .require_approval(
+            task_id,
+            actor(harness.owner_principal_id),
+            RequireApprovalCommand {
+                approval_gate_id: "gate-call-only".to_owned(),
+                blocked_call_id: Some("call-call-only".to_owned()),
+                details: json!({"capability_id": "C2"}),
+            },
+        )
+        .await
+        .expect("approval gate should be created");
+
+    let signal = harness
+        .manager
+        .submit_control_signal(
+            task_id,
+            PrincipalAttribution {
+                principal_id: approver_principal_id,
+                principal_role: "approving".to_owned(),
+            },
+            SubmitControlSignalCommand {
+                signal_type: ControlSignalType::Approve,
+                payload: json!({
+                    "blocked_call_id": "call-call-only",
+                }),
+            },
+        )
+        .await
+        .expect("blocked call id should be sufficient to resolve approval");
+    assert_eq!(signal.status, ControlSignalStatus::Applied);
+
+    let task = harness
+        .manager
+        .get_task(task_id)
+        .await
+        .expect("task should remain queryable");
+    assert_eq!(task.status, TaskStatus::Running);
 }
 
 #[tokio::test]
@@ -1592,6 +1759,29 @@ async fn cts_22_deny_control_signal_blocks_execution_and_is_auditable() {
     assert_eq!(events[3].payload["blocked_call_id"], "call-deny");
     assert_eq!(events[5].payload["approval_gate_id"], "gate-deny");
     assert_eq!(events[5].payload["blocked_call_id"], "call-deny");
+    let event_types: Vec<_> = events
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect();
+    assert_eq!(
+        event_types,
+        vec![
+            "task.created",
+            "task.ready",
+            "task.started",
+            "policy.result.require_approval",
+            "task.awaiting_control",
+            "control.signal.received",
+            "task.failed",
+            "control.signal.applied",
+        ]
+    );
+
+    assert_eq!(events[3].event_family, EventFamily::Policy);
+    assert_eq!(events[3].payload["approval_gate_id"], "gate-deny");
+    assert_eq!(events[3].payload["blocked_call_id"], "call-deny");
+    assert_eq!(events[5].payload["approval_gate_id"], "gate-deny");
+    assert_eq!(events[5].payload["blocked_call_id"], "call-deny");
     assert_eq!(events[6].event_type, "task.failed");
     assert_eq!(
         events[6].payload["details"]["reason_code"],
@@ -1602,8 +1792,15 @@ async fn cts_22_deny_control_signal_blocks_execution_and_is_auditable() {
         "gate-deny"
     );
     assert_eq!(events[6].payload["details"]["blocked_call_id"], "call-deny");
+    assert_eq!(
+        events[6].payload["details"]["approval_gate_id"],
+        "gate-deny"
+    );
+    assert_eq!(events[6].payload["details"]["blocked_call_id"], "call-deny");
     assert_eq!(events[7].event_type, "control.signal.applied");
     assert_eq!(events[7].payload["action"], "deny");
+    assert_eq!(events[7].payload["approval_gate_id"], "gate-deny");
+    assert_eq!(events[7].payload["blocked_call_id"], "call-deny");
     assert_eq!(events[7].payload["approval_gate_id"], "gate-deny");
     assert_eq!(events[7].payload["blocked_call_id"], "call-deny");
     assert_eq!(events[7].payload["status_after"], "failed");
@@ -1615,9 +1812,18 @@ async fn cts_22_deny_control_signal_blocks_execution_and_is_auditable() {
     assert!(events
         .iter()
         .all(|event| event.event_family != EventFamily::Capability));
+    assert_eq!(events[3].correlation_id, events[4].correlation_id);
+    assert_eq!(events[5].correlation_id, events[6].correlation_id);
+    assert_eq!(events[6].correlation_id, events[7].correlation_id);
+    assert_eq!(events[6].causation_event_id, Some(events[5].event_id));
+    assert_eq!(events[7].causation_event_id, Some(events[5].event_id));
+    assert!(events
+        .iter()
+        .all(|event| event.event_family != EventFamily::Capability));
 }
 
 #[tokio::test]
+async fn cts_16_pause_signal_is_deferred_until_next_safe_boundary() {
 async fn cts_16_pause_signal_is_deferred_until_next_safe_boundary() {
     let harness = setup_harness().await;
     let task_id = create_task(&harness, "deferred-control").await;
@@ -1648,6 +1854,27 @@ async fn cts_16_pause_signal_is_deferred_until_next_safe_boundary() {
         .await
         .expect("task should load");
     assert_eq!(running_task.status, TaskStatus::Running);
+
+    let events_before_apply = harness
+        .manager
+        .list_events_by_task(task_id)
+        .await
+        .expect("events should load before apply");
+    let received = &events_before_apply[3];
+    let deferred_event = &events_before_apply[4];
+    assert_eq!(received.event_type, "control.signal.received");
+    assert_eq!(deferred_event.event_type, "control.signal.deferred");
+    assert_eq!(received.payload["action"], "pause");
+    assert_eq!(deferred_event.payload["action"], "pause");
+    assert_eq!(
+        deferred_event.payload["reason_code"],
+        "unsafe_interruption_boundary"
+    );
+    assert_eq!(received.correlation_id, deferred_event.correlation_id);
+    assert_eq!(deferred_event.causation_event_id, Some(received.event_id));
+    assert!(!events_before_apply
+        .iter()
+        .any(|event| event.event_type == "task.paused"));
 
     let events_before_apply = harness
         .manager
@@ -1705,6 +1932,127 @@ async fn cts_16_pause_signal_is_deferred_until_next_safe_boundary() {
             "task.paused",
             "control.signal.applied",
         ]
+    );
+
+    let pause_event = &events[5];
+    let applied_event = &events[6];
+    assert_eq!(pause_event.event_type, "task.paused");
+    assert_eq!(applied_event.event_type, "control.signal.applied");
+    assert_eq!(applied_event.payload["action"], "pause");
+    assert_eq!(applied_event.payload["status_before"], "running");
+    assert_eq!(applied_event.payload["status_after"], "paused");
+    assert_eq!(applied_event.payload["applied_event_type"], "task.paused");
+    assert_eq!(events[3].correlation_id, events[4].correlation_id);
+    assert_eq!(events[4].correlation_id, pause_event.correlation_id);
+    assert_eq!(pause_event.correlation_id, applied_event.correlation_id);
+}
+
+#[tokio::test]
+async fn cts_17_interrupt_semantics_are_explainable_via_deferred_signal_events() {
+    let harness = setup_harness().await;
+    let task_id = create_task(&harness, "interrupt-explainability").await;
+
+    harness
+        .manager
+        .start_task(task_id, actor(harness.owner_principal_id))
+        .await
+        .expect("start should succeed");
+
+    let deferred = harness
+        .manager
+        .submit_control_signal(
+            task_id,
+            actor(harness.owner_principal_id),
+            SubmitControlSignalCommand {
+                signal_type: ControlSignalType::Pause,
+                payload: json!({
+                    "unsafe_boundary": true,
+                    "operator_note": "pause_after_safe_boundary"
+                }),
+            },
+        )
+        .await
+        .expect("deferred signal should be recorded");
+    assert_eq!(deferred.status, ControlSignalStatus::Deferred);
+
+    let task_before_apply = harness
+        .manager
+        .get_task(task_id)
+        .await
+        .expect("task should load");
+    assert_eq!(task_before_apply.status, TaskStatus::Running);
+
+    let events_before_apply = harness
+        .manager
+        .list_events_by_task(task_id)
+        .await
+        .expect("events should load before apply");
+    let event_types_before_apply: Vec<_> = events_before_apply
+        .iter()
+        .map(|event| event.event_type.as_str())
+        .collect();
+    assert_eq!(
+        event_types_before_apply,
+        vec![
+            "task.created",
+            "task.ready",
+            "task.started",
+            "control.signal.received",
+            "control.signal.deferred",
+        ]
+    );
+
+    let signal_received = &events_before_apply[3];
+    let signal_deferred = &events_before_apply[4];
+    assert_eq!(signal_received.payload["action"], "pause");
+    assert_eq!(signal_deferred.payload["action"], "pause");
+    assert_eq!(
+        signal_deferred.payload["reason_code"],
+        "unsafe_interruption_boundary"
+    );
+    assert_eq!(signal_deferred.payload["details"]["unsafe_boundary"], true);
+    assert_eq!(
+        signal_deferred.payload["details"]["operator_note"],
+        "pause_after_safe_boundary"
+    );
+    assert_eq!(
+        signal_received.state_version_ref,
+        signal_deferred.state_version_ref
+    );
+    assert_eq!(
+        signal_received.correlation_id,
+        signal_deferred.correlation_id
+    );
+    assert_eq!(
+        signal_deferred.causation_event_id,
+        Some(signal_received.event_id)
+    );
+
+    let applied = harness
+        .manager
+        .apply_pending_control_signals(task_id)
+        .await
+        .expect("pending signals should apply");
+    assert_eq!(applied.len(), 1);
+    assert_eq!(applied[0].status, ControlSignalStatus::Applied);
+
+    let task_after_apply = harness
+        .manager
+        .get_task(task_id)
+        .await
+        .expect("task should load");
+    assert_eq!(task_after_apply.status, TaskStatus::Paused);
+
+    let events_after_apply = harness
+        .manager
+        .list_events_by_task(task_id)
+        .await
+        .expect("events should load after apply");
+    assert_eq!(events_after_apply[5].event_type, "task.paused");
+    assert_eq!(events_after_apply[6].event_type, "control.signal.applied");
+    assert_eq!(
+        events_after_apply[6].payload["applied_event_type"],
+        "task.paused"
     );
 
     let pause_event = &events[5];

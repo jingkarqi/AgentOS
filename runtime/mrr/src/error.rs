@@ -31,6 +31,11 @@ pub enum RuntimeError {
     InvalidEnumValue { kind: &'static str, value: String },
     #[error("invalid uuid for {field}: {value}")]
     InvalidUuid { field: &'static str, value: String },
+    #[error("capability schema validation failed in {context}: {message}")]
+    CapabilitySchemaValidation {
+        context: &'static str,
+        message: String,
+    },
     #[error("invariant violation: {0}")]
     InvariantViolation(String),
 }
