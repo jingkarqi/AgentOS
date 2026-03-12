@@ -276,10 +276,11 @@ SHOULD 级要求如未满足，测试应标记为“弱一致（weakly conforman
 
 ### CTS-17 中断语义必须可解释
 - requirements: Kernel 13.5.1
-- setup: 在 model streaming 过程中 pause
+- setup: 在 model streaming 过程中 pause；若实现未暴露 streaming，则在其已声明的 unsafe boundary 中 pause
 - assertions:
-  - 实现对“部分输出”处理符合其声明（discard / preserved non-authoritative / committed authoritative）
-  - 事件中可见该决策
+  - 实现对“部分输出”或“尚未越过安全边界的请求效果”处理符合其声明
+  - 若实现采用 deferred-at-safe-boundary 模型，则 defer 原因、defer 期间未发生 authoritative 状态变更、以及后续生效边界都必须可从事件解释
+  - 事件中可见该决策（例如 `control.signal.deferred` 与后续 `control.signal.applied`）
 
 ## 6.9 重试、幂等与 finality
 
@@ -332,6 +333,7 @@ SHOULD 级要求如未满足，测试应标记为“弱一致（weakly conforman
   - 在收到 approve 之前不得出现 capability.dispatched
   - approve 之后出现 control.signal.*（received/applied）且 capability.dispatched 才允许继续
   - 若发送 control.deny，则不得发生 dispatch，且必须留下可审计的拒绝事件
+  - 若实现当前只覆盖 approval gate 而尚未公开 capability dispatch，则最小断言仍必须验证 gate/call linkage 可审计、approve/deny 仅能通过 control signal 解析，且在 approve 之前不得出现任何等价的继续执行证据；一旦实现 `capability.dispatched`，仍必须满足上述顺序要求
 
 ---
 
