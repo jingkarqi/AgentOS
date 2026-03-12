@@ -8,11 +8,15 @@ use uuid::Uuid;
 
 use crate::checkpoint_store::{CheckpointRecord, CheckpointStore, NewCheckpointRecord};
 use crate::clock::{Clock, IdGenerator};
+use crate::control_signal::{
+    ControlSignalRecord, ControlSignalStatus, ControlSignalStore, ControlSignalType,
+    NewControlSignalRecord, SubmitControlSignalCommand,
+};
 use crate::db::{decode_timestamp, encode_timestamp, parse_optional_uuid, parse_uuid};
 use crate::error::{Result, RuntimeError};
 use crate::event_log::{EventDraft, EventEnvelope, EventFamily, EventLog};
 use crate::principal::{PrincipalAttribution, PrincipalStatus, PrincipalStore};
-use crate::state_store::{NewStateVersion, StateStore, StateVersionRef};
+use crate::state_store::{NewStateVersion, StateStore, StateVersionRef, TaskStateVersion};
 use crate::task::{CreateTaskCommand, Task, TaskStatus};
 
 #[derive(Debug, Clone)]
@@ -45,11 +49,30 @@ struct CheckpointPayload {
     details: Value,
 }
 
+#[derive(Debug, Clone)]
+pub struct RequireApprovalCommand {
+    pub approval_gate_id: String,
+    pub blocked_call_id: Option<String>,
+    pub details: Value,
+}
+
+impl RequireApprovalCommand {
+    pub fn new(approval_gate_id: impl Into<String>) -> Self {
+        Self {
+            approval_gate_id: approval_gate_id.into(),
+            blocked_call_id: None,
+            details: json!({}),
+        }
+    }
+}
+
 struct StatusChange<'a> {
     to_status: TaskStatus,
     event_type: &'a str,
     details: Value,
     result_ref: Option<String>,
+    correlation_id: Option<String>,
+    causation_event_id: Option<Uuid>,
 }
 
 struct TransitionRequest<'a> {
@@ -65,6 +88,21 @@ struct RestoreFailure<'a> {
     reason_code: &'a str,
 }
 
+struct AppliedStatusChange {
+    event: EventEnvelope,
+    state_version_ref: Uuid,
+}
+
+struct TaskMutation<'a> {
+    event_type: &'a str,
+    details: Value,
+    goal: Option<String>,
+    owner_principal_id: Option<Uuid>,
+    budget_context_ref: Option<String>,
+    correlation_id: Option<String>,
+    causation_event_id: Option<Uuid>,
+}
+
 #[derive(Clone)]
 pub struct TaskManager {
     pool: SqlitePool,
@@ -72,6 +110,7 @@ pub struct TaskManager {
     event_log: EventLog,
     state_store: StateStore,
     checkpoint_store: CheckpointStore,
+    control_signal_store: ControlSignalStore,
     clock: Arc<dyn Clock>,
     id_generator: Arc<dyn IdGenerator>,
     config: TaskManagerConfig,
@@ -89,6 +128,7 @@ impl TaskManager {
             event_log: EventLog::new(config.outbox_publication_topic.clone()),
             state_store: StateStore,
             checkpoint_store: CheckpointStore,
+            control_signal_store: ControlSignalStore,
             pool,
             clock,
             id_generator,
@@ -102,6 +142,10 @@ impl TaskManager {
 
     pub fn checkpoint_store(&self) -> CheckpointStore {
         self.checkpoint_store.clone()
+    }
+
+    pub fn control_signal_store(&self) -> ControlSignalStore {
+        self.control_signal_store.clone()
     }
 
     pub async fn create_task(&self, command: CreateTaskCommand) -> Result<Task> {
@@ -225,6 +269,8 @@ impl TaskManager {
                         event_type: "task.ready",
                         details: json!({"reason_code": "ready_for_execution"}),
                         result_ref: None,
+                        correlation_id: None,
+                        causation_event_id: None,
                     },
                 )
                 .await?;
@@ -239,6 +285,8 @@ impl TaskManager {
                         event_type: "task.started",
                         details: json!({"reason_code": "started"}),
                         result_ref: None,
+                        correlation_id: None,
+                        causation_event_id: None,
                     },
                 )
                 .await?;
@@ -253,6 +301,8 @@ impl TaskManager {
                         event_type: "task.started",
                         details: json!({"reason_code": "started"}),
                         result_ref: None,
+                        correlation_id: None,
+                        causation_event_id: None,
                     },
                 )
                 .await?;
@@ -284,6 +334,8 @@ impl TaskManager {
                     event_type: "task.paused",
                     details: json!({"reason_code": "paused_by_operator"}),
                     result_ref: None,
+                    correlation_id: None,
+                    causation_event_id: None,
                 },
             },
         )
@@ -301,6 +353,8 @@ impl TaskManager {
                     event_type: "task.resumed",
                     details: json!({"reason_code": "resumed_by_operator"}),
                     result_ref: None,
+                    correlation_id: None,
+                    causation_event_id: None,
                 },
             },
         )
@@ -324,6 +378,8 @@ impl TaskManager {
                     event_type: "task.completed",
                     details: json!({ "result": result_payload }),
                     result_ref,
+                    correlation_id: None,
+                    causation_event_id: None,
                 },
             },
         )
@@ -347,6 +403,8 @@ impl TaskManager {
                     event_type: "task.failed",
                     details: json!({ "failure": failure_payload }),
                     result_ref,
+                    correlation_id: None,
+                    causation_event_id: None,
                 },
             },
         )
@@ -363,16 +421,103 @@ impl TaskManager {
             task_id,
             actor,
             TransitionRequest {
-                allowed_from: &[TaskStatus::Created, TaskStatus::Ready, TaskStatus::Running],
+                allowed_from: &[TaskStatus::Running, TaskStatus::Paused],
                 change: StatusChange {
                     to_status: TaskStatus::Cancelled,
                     event_type: "task.cancelled",
                     details: json!({ "cancellation": cancellation_payload }),
                     result_ref: None,
+                    correlation_id: None,
+                    causation_event_id: None,
                 },
             },
         )
         .await
+    }
+
+    pub async fn require_approval(
+        &self,
+        task_id: Uuid,
+        actor: PrincipalAttribution,
+        command: RequireApprovalCommand,
+    ) -> Result<Task> {
+        let mut tx = self.pool.begin().await?;
+        let row = fetch_task_row(&mut *tx, task_id).await?;
+        self.ensure_task_actor_is_owner(&mut tx, &row, &actor)
+            .await?;
+
+        let current_status = row.status()?;
+        if current_status != TaskStatus::Running {
+            self.record_transition_rejection(&mut tx, &row, TaskStatus::WaitingOnControl, actor)
+                .await?;
+            tx.commit().await?;
+            return Err(RuntimeError::InvalidTransition {
+                task_id,
+                from_status: current_status.as_str().to_owned(),
+                to_status: TaskStatus::WaitingOnControl.as_str().to_owned(),
+            });
+        }
+
+        let current_state_version_ref = parse_uuid("working_state_ref", &row.working_state_ref)?;
+        let checkpoint_ref = parse_optional_uuid("checkpoint_ref", row.checkpoint_ref.clone())?;
+        let correlation_id = format!("approval:gate:{}", command.approval_gate_id);
+        let now = self.clock.now();
+
+        let policy_event = self
+            .event_log
+            .append(
+                &mut tx,
+                self.id_generator.as_ref(),
+                self.clock.as_ref(),
+                EventDraft {
+                    event_type: "policy.result.require_approval".to_owned(),
+                    event_family: EventFamily::Policy,
+                    task_id,
+                    occurred_at: now,
+                    emitted_by: self.config.emitted_by.clone(),
+                    payload: json!({
+                        "outcome": "require_approval",
+                        "reason_code": "requires_higher_authority",
+                        "approval_gate_id": command.approval_gate_id,
+                        "blocked_call_id": command.blocked_call_id,
+                        "details": command.details.clone(),
+                    }),
+                    correlation_id: Some(correlation_id.clone()),
+                    causation_event_id: None,
+                    principal: Some(actor.clone()),
+                    policy_context_ref: Some(row.policy_context_ref.clone()),
+                    budget_context_ref: Some(row.budget_context_ref.clone()),
+                    checkpoint_ref,
+                    state_version_ref: Some(current_state_version_ref),
+                    evidence_ref: None,
+                    trace_ref: None,
+                    tenant_id: None,
+                },
+            )
+            .await?;
+
+        self.apply_status_change(
+            &mut tx,
+            &row,
+            actor,
+            StatusChange {
+                to_status: TaskStatus::WaitingOnControl,
+                event_type: "task.awaiting_control",
+                details: json!({
+                    "reason_code": "require_approval",
+                    "approval_gate_id": command.approval_gate_id,
+                    "blocked_call_id": command.blocked_call_id,
+                    "details": command.details,
+                }),
+                result_ref: None,
+                correlation_id: Some(correlation_id),
+                causation_event_id: Some(policy_event.event_id),
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        self.get_task(task_id).await
     }
 
     pub async fn get_task(&self, task_id: Uuid) -> Result<Task> {
@@ -401,6 +546,156 @@ impl TaskManager {
 
     pub async fn list_events_by_task(&self, task_id: Uuid) -> Result<Vec<EventEnvelope>> {
         self.event_log.list_by_task(&self.pool, task_id).await
+    }
+
+    pub async fn list_control_signals_by_task(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<ControlSignalRecord>> {
+        self.control_signal_store
+            .list_by_task(&self.pool, task_id)
+            .await
+    }
+
+    pub async fn apply_pending_control_signals(
+        &self,
+        task_id: Uuid,
+    ) -> Result<Vec<ControlSignalRecord>> {
+        let mut tx = self.pool.begin().await?;
+        fetch_task_row(&mut *tx, task_id).await?;
+
+        let deferred = self
+            .control_signal_store
+            .list_deferred_by_task_in(&mut *tx, task_id)
+            .await?;
+        let mut applied = Vec::with_capacity(deferred.len());
+
+        for signal in deferred {
+            let row = fetch_task_row(&mut *tx, task_id).await?;
+            let current_state_version_ref =
+                parse_uuid("working_state_ref", &row.working_state_ref)?;
+            let checkpoint_ref = parse_optional_uuid("checkpoint_ref", row.checkpoint_ref.clone())?;
+            let updated = self
+                .apply_control_signal_in_tx(
+                    &mut tx,
+                    &row,
+                    PrincipalAttribution {
+                        principal_id: signal.issuer_principal_id,
+                        principal_role: signal.issuer_principal_role.clone(),
+                    },
+                    signal.signal_id,
+                    signal.signal_type.clone(),
+                    signal.payload.clone(),
+                    &signal.correlation_id,
+                    signal.received_event_id,
+                    current_state_version_ref,
+                    checkpoint_ref,
+                    false,
+                )
+                .await?;
+            applied.push(updated);
+        }
+
+        tx.commit().await?;
+        Ok(applied)
+    }
+
+    pub async fn submit_control_signal(
+        &self,
+        task_id: Uuid,
+        actor: PrincipalAttribution,
+        command: SubmitControlSignalCommand,
+    ) -> Result<ControlSignalRecord> {
+        let mut tx = self.pool.begin().await?;
+        let row = fetch_task_row(&mut *tx, task_id).await?;
+        self.ensure_active_principal_in_tx(&mut tx, actor.principal_id)
+            .await?;
+
+        let current_status = row.status()?;
+        let current_state_version_ref = parse_uuid("working_state_ref", &row.working_state_ref)?;
+        let checkpoint_ref = parse_optional_uuid("checkpoint_ref", row.checkpoint_ref.clone())?;
+        let now = self.clock.now();
+        let signal_id = self.id_generator.next_uuid();
+        let correlation_id = format!("control:signal:{signal_id}");
+        let (approval_gate_id, blocked_call_id) = control_signal_linkage(&command.payload);
+
+        let received = self
+            .event_log
+            .append(
+                &mut tx,
+                self.id_generator.as_ref(),
+                self.clock.as_ref(),
+                EventDraft {
+                    event_type: "control.signal.received".to_owned(),
+                    event_family: EventFamily::Control,
+                    task_id,
+                    occurred_at: now,
+                    emitted_by: self.config.emitted_by.clone(),
+                    payload: json!({
+                        "signal_id": signal_id,
+                        "action": command.signal_type.as_str(),
+                        "issuer_principal_id": actor.principal_id,
+                        "requested_effect": command.signal_type.as_str(),
+                        "status_before": current_status.as_str(),
+                        "approval_gate_id": approval_gate_id,
+                        "blocked_call_id": blocked_call_id,
+                        "details": command.payload.clone(),
+                    }),
+                    correlation_id: Some(correlation_id.clone()),
+                    causation_event_id: None,
+                    principal: Some(actor.clone()),
+                    policy_context_ref: Some(row.policy_context_ref.clone()),
+                    budget_context_ref: Some(row.budget_context_ref.clone()),
+                    checkpoint_ref,
+                    state_version_ref: Some(current_state_version_ref),
+                    evidence_ref: None,
+                    trace_ref: None,
+                    tenant_id: None,
+                },
+            )
+            .await?;
+
+        let signal = self
+            .control_signal_store
+            .record(
+                &mut tx,
+                NewControlSignalRecord {
+                    signal_id,
+                    task_id,
+                    signal_type: command.signal_type.clone(),
+                    status: ControlSignalStatus::Received,
+                    issuer_principal_id: actor.principal_id,
+                    issuer_principal_role: actor.principal_role.clone(),
+                    payload: command.payload.clone(),
+                    correlation_id: correlation_id.clone(),
+                    received_event_id: received.event_id,
+                    received_sequence_number: received.sequence_number,
+                    created_at: now,
+                    applied_at: None,
+                    outcome_event_id: None,
+                    outcome_sequence_number: None,
+                },
+            )
+            .await?;
+
+        let applied = self
+            .apply_control_signal_in_tx(
+                &mut tx,
+                &row,
+                actor,
+                signal.signal_id,
+                signal.signal_type,
+                command.payload,
+                &correlation_id,
+                received.event_id,
+                current_state_version_ref,
+                checkpoint_ref,
+                true,
+            )
+            .await?;
+
+        tx.commit().await?;
+        Ok(applied)
     }
 
     pub async fn create_checkpoint(
@@ -888,12 +1183,14 @@ impl TaskManager {
         row: &TaskRow,
         actor: PrincipalAttribution,
         change: StatusChange<'_>,
-    ) -> Result<()> {
+    ) -> Result<AppliedStatusChange> {
         let StatusChange {
             to_status,
             event_type,
             details,
             result_ref,
+            correlation_id,
+            causation_event_id,
         } = change;
         let task_id = row.task_id()?;
         let from_status = row.status()?;
@@ -942,7 +1239,8 @@ impl TaskManager {
         .execute(&mut **tx)
         .await?;
 
-        self.event_log
+        let event = self
+            .event_log
             .append(
                 tx,
                 self.id_generator.as_ref(),
@@ -958,8 +1256,8 @@ impl TaskManager {
                         "to_status": to_status.as_str(),
                         "details": details,
                     }),
-                    correlation_id: None,
-                    causation_event_id: None,
+                    correlation_id,
+                    causation_event_id,
                     principal: Some(actor),
                     policy_context_ref: Some(row.policy_context_ref.clone()),
                     budget_context_ref: Some(row.budget_context_ref.clone()),
@@ -975,7 +1273,1056 @@ impl TaskManager {
             )
             .await?;
 
-        Ok(())
+        Ok(AppliedStatusChange {
+            event,
+            state_version_ref: state_version.state_version_ref.state_version_id,
+        })
+    }
+
+    async fn apply_task_mutation(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        row: &TaskRow,
+        actor: PrincipalAttribution,
+        mutation: TaskMutation<'_>,
+    ) -> Result<AppliedStatusChange> {
+        let TaskMutation {
+            event_type,
+            details,
+            goal,
+            owner_principal_id,
+            budget_context_ref,
+            correlation_id,
+            causation_event_id,
+        } = mutation;
+        let task_id = row.task_id()?;
+        let status = row.status()?;
+        let now = self.clock.now();
+        let next_goal = goal.unwrap_or_else(|| row.goal.clone());
+        let next_owner_principal_id = owner_principal_id.unwrap_or(row.owner_principal_id()?);
+        let next_budget_context_ref =
+            budget_context_ref.unwrap_or_else(|| row.budget_context_ref.clone());
+        let state_details = details.clone();
+
+        let state_version = self
+            .state_store
+            .append_version(
+                tx,
+                NewStateVersion {
+                    state_version_id: self.id_generator.next_uuid(),
+                    task_id,
+                    status: status.clone(),
+                    payload: json!({
+                        "status": status.as_str(),
+                        "applied_event_type": event_type,
+                        "from_status": status.as_str(),
+                        "details": state_details,
+                    }),
+                    created_at: now,
+                    created_by: self.config.emitted_by.clone(),
+                },
+            )
+            .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE tasks
+            SET
+                goal = ?,
+                status = ?,
+                owner_principal_id = ?,
+                updated_at = ?,
+                working_state_ref = ?,
+                checkpoint_ref = ?,
+                budget_context_ref = ?,
+                result_ref = ?
+            WHERE task_id = ?
+            "#,
+        )
+        .bind(&next_goal)
+        .bind(status.as_str())
+        .bind(next_owner_principal_id.to_string())
+        .bind(encode_timestamp(now)?)
+        .bind(state_version.state_version_ref.state_version_id.to_string())
+        .bind(row.checkpoint_ref.clone())
+        .bind(&next_budget_context_ref)
+        .bind(row.result_ref.clone())
+        .bind(task_id.to_string())
+        .execute(&mut **tx)
+        .await?;
+
+        let event = self
+            .event_log
+            .append(
+                tx,
+                self.id_generator.as_ref(),
+                self.clock.as_ref(),
+                EventDraft {
+                    event_type: event_type.to_owned(),
+                    event_family: EventFamily::Task,
+                    task_id,
+                    occurred_at: now,
+                    emitted_by: self.config.emitted_by.clone(),
+                    payload: json!({
+                        "from_status": status.as_str(),
+                        "to_status": status.as_str(),
+                        "details": details,
+                    }),
+                    correlation_id,
+                    causation_event_id,
+                    principal: Some(actor),
+                    policy_context_ref: Some(row.policy_context_ref.clone()),
+                    budget_context_ref: Some(next_budget_context_ref),
+                    checkpoint_ref: parse_optional_uuid(
+                        "checkpoint_ref",
+                        row.checkpoint_ref.clone(),
+                    )?,
+                    state_version_ref: Some(state_version.state_version_ref.state_version_id),
+                    evidence_ref: None,
+                    trace_ref: None,
+                    tenant_id: None,
+                },
+            )
+            .await?;
+
+        Ok(AppliedStatusChange {
+            event,
+            state_version_ref: state_version.state_version_ref.state_version_id,
+        })
+    }
+
+    async fn apply_control_signal_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        row: &TaskRow,
+        actor: PrincipalAttribution,
+        signal_id: Uuid,
+        signal_type: ControlSignalType,
+        payload: Value,
+        correlation_id: &str,
+        received_event_id: Uuid,
+        current_state_version_ref: Uuid,
+        checkpoint_ref: Option<Uuid>,
+        allow_defer: bool,
+    ) -> Result<ControlSignalRecord> {
+        let current_status = row.status()?;
+
+        if allow_defer && control_signal_defer_requested(&payload) {
+            return self
+                .record_control_signal_deferred(
+                    tx,
+                    row,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status,
+                    current_state_version_ref,
+                    checkpoint_ref,
+                    "unsafe_interruption_boundary",
+                )
+                .await;
+        }
+
+        match signal_type {
+            ControlSignalType::Approve => {
+                if current_status != TaskStatus::WaitingOnControl {
+                    let reason_code = if current_status.is_terminal() {
+                        "terminal_state_irreversible"
+                    } else {
+                        "illegal_transition"
+                    };
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            reason_code,
+                        )
+                        .await;
+                }
+
+                let waiting_state = self
+                    .state_store
+                    .get_by_ref_in(&mut **tx, current_state_version_ref)
+                    .await?;
+                let (approval_gate_id, blocked_call_id) =
+                    match validate_waiting_on_control_resolution(&waiting_state, &payload) {
+                        Ok(linkage) => linkage,
+                        Err(reason_code) => {
+                            return self
+                                .record_control_signal_rejected(
+                                    tx,
+                                    row,
+                                    actor,
+                                    signal_id,
+                                    signal_type,
+                                    payload,
+                                    correlation_id,
+                                    received_event_id,
+                                    current_status,
+                                    current_state_version_ref,
+                                    checkpoint_ref,
+                                    reason_code,
+                                )
+                                .await;
+                        }
+                    };
+
+                let applied_change = self
+                    .apply_status_change(
+                        tx,
+                        row,
+                        actor.clone(),
+                        StatusChange {
+                            to_status: TaskStatus::Running,
+                            event_type: "task.control.approved",
+                            details: json!({
+                                "reason_code": "approval_granted",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "approve",
+                                "approval_gate_id": approval_gate_id,
+                                "blocked_call_id": blocked_call_id,
+                                "details": payload.clone(),
+                            }),
+                            result_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status,
+                    TaskStatus::Running,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::Deny => {
+                if current_status != TaskStatus::WaitingOnControl {
+                    let reason_code = if current_status.is_terminal() {
+                        "terminal_state_irreversible"
+                    } else {
+                        "illegal_transition"
+                    };
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            reason_code,
+                        )
+                        .await;
+                }
+
+                let waiting_state = self
+                    .state_store
+                    .get_by_ref_in(&mut **tx, current_state_version_ref)
+                    .await?;
+                let (approval_gate_id, blocked_call_id) =
+                    match validate_waiting_on_control_resolution(&waiting_state, &payload) {
+                        Ok(linkage) => linkage,
+                        Err(reason_code) => {
+                            return self
+                                .record_control_signal_rejected(
+                                    tx,
+                                    row,
+                                    actor,
+                                    signal_id,
+                                    signal_type,
+                                    payload,
+                                    correlation_id,
+                                    received_event_id,
+                                    current_status,
+                                    current_state_version_ref,
+                                    checkpoint_ref,
+                                    reason_code,
+                                )
+                                .await;
+                        }
+                    };
+
+                let applied_change = self
+                    .apply_status_change(
+                        tx,
+                        row,
+                        actor.clone(),
+                        StatusChange {
+                            to_status: TaskStatus::Failed,
+                            event_type: "task.failed",
+                            details: json!({
+                                "reason_code": "approval_denied",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "deny",
+                                "approval_gate_id": approval_gate_id,
+                                "blocked_call_id": blocked_call_id,
+                                "details": payload.clone(),
+                            }),
+                            result_ref: Some(format!(
+                                "result://task/{}/approval-denied",
+                                row.task_id()?
+                            )),
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status,
+                    TaskStatus::Failed,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::Pause if current_status == TaskStatus::Running => {
+                let applied_change = self
+                    .apply_status_change(
+                        tx,
+                        row,
+                        actor.clone(),
+                        StatusChange {
+                            to_status: TaskStatus::Paused,
+                            event_type: "task.paused",
+                            details: json!({
+                                "reason_code": "paused_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "pause",
+                                "details": payload.clone(),
+                            }),
+                            result_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status,
+                    TaskStatus::Paused,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::Resume if current_status == TaskStatus::Paused => {
+                let applied_change = self
+                    .apply_status_change(
+                        tx,
+                        row,
+                        actor.clone(),
+                        StatusChange {
+                            to_status: TaskStatus::Running,
+                            event_type: "task.resumed",
+                            details: json!({
+                                "reason_code": "resumed_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "resume",
+                                "details": payload.clone(),
+                            }),
+                            result_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status,
+                    TaskStatus::Running,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::ModifyBudget => {
+                let Some(next_budget_context_ref) = payload
+                    .get("budget_context_ref")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                else {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "invalid_control_payload",
+                        )
+                        .await;
+                };
+
+                if current_status.is_terminal() {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "terminal_state_irreversible",
+                        )
+                        .await;
+                }
+
+                let applied_change = self
+                    .apply_task_mutation(
+                        tx,
+                        row,
+                        actor.clone(),
+                        TaskMutation {
+                            event_type: "task.budget_modified",
+                            details: json!({
+                                "reason_code": "budget_modified_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "modify_budget",
+                                "budget_context_ref": next_budget_context_ref,
+                                "details": payload.clone(),
+                            }),
+                            goal: None,
+                            owner_principal_id: None,
+                            budget_context_ref: Some(next_budget_context_ref),
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status.clone(),
+                    current_status,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::ModifyScope => {
+                if current_status.is_terminal() {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "terminal_state_irreversible",
+                        )
+                        .await;
+                }
+
+                let next_goal = payload
+                    .get("goal")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let applied_change = self
+                    .apply_task_mutation(
+                        tx,
+                        row,
+                        actor.clone(),
+                        TaskMutation {
+                            event_type: "task.scope_modified",
+                            details: json!({
+                                "reason_code": "scope_modified_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "modify_scope",
+                                "details": payload.clone(),
+                            }),
+                            goal: next_goal,
+                            owner_principal_id: None,
+                            budget_context_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status.clone(),
+                    current_status,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::Steer => {
+                if current_status.is_terminal() {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "terminal_state_irreversible",
+                        )
+                        .await;
+                }
+
+                let applied_change = self
+                    .apply_task_mutation(
+                        tx,
+                        row,
+                        actor.clone(),
+                        TaskMutation {
+                            event_type: "task.steered",
+                            details: json!({
+                                "reason_code": "steered_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "steer",
+                                "details": payload.clone(),
+                            }),
+                            goal: payload
+                                .get("goal")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned),
+                            owner_principal_id: None,
+                            budget_context_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status.clone(),
+                    current_status,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::TakeOver => {
+                if current_status.is_terminal() {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "terminal_state_irreversible",
+                        )
+                        .await;
+                }
+
+                let applied_change = self
+                    .apply_task_mutation(
+                        tx,
+                        row,
+                        actor.clone(),
+                        TaskMutation {
+                            event_type: "task.taken_over",
+                            details: json!({
+                                "reason_code": "taken_over_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "take_over",
+                                "next_owner_principal_id": actor.principal_id,
+                                "details": payload.clone(),
+                            }),
+                            goal: None,
+                            owner_principal_id: Some(actor.principal_id),
+                            budget_context_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status.clone(),
+                    current_status,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::Reassign => {
+                if current_status.is_terminal() {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "terminal_state_irreversible",
+                        )
+                        .await;
+                }
+
+                let Some(next_owner_principal_id) = parse_control_target_principal_id(&payload)
+                else {
+                    return self
+                        .record_control_signal_rejected(
+                            tx,
+                            row,
+                            actor,
+                            signal_id,
+                            signal_type,
+                            payload,
+                            correlation_id,
+                            received_event_id,
+                            current_status,
+                            current_state_version_ref,
+                            checkpoint_ref,
+                            "invalid_control_payload",
+                        )
+                        .await;
+                };
+
+                let target_status = self
+                    .principal_status_in_tx(tx, next_owner_principal_id)
+                    .await?;
+                match target_status {
+                    Some(PrincipalStatus::Active) => {}
+                    Some(_) => {
+                        return self
+                            .record_control_signal_rejected(
+                                tx,
+                                row,
+                                actor,
+                                signal_id,
+                                signal_type,
+                                payload,
+                                correlation_id,
+                                received_event_id,
+                                current_status,
+                                current_state_version_ref,
+                                checkpoint_ref,
+                                "target_principal_inactive",
+                            )
+                            .await;
+                    }
+                    None => {
+                        return self
+                            .record_control_signal_rejected(
+                                tx,
+                                row,
+                                actor,
+                                signal_id,
+                                signal_type,
+                                payload,
+                                correlation_id,
+                                received_event_id,
+                                current_status,
+                                current_state_version_ref,
+                                checkpoint_ref,
+                                "target_principal_not_found",
+                            )
+                            .await;
+                    }
+                }
+
+                let applied_change = self
+                    .apply_task_mutation(
+                        tx,
+                        row,
+                        actor.clone(),
+                        TaskMutation {
+                            event_type: "task.reassigned",
+                            details: json!({
+                                "reason_code": "reassigned_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "reassign",
+                                "next_owner_principal_id": next_owner_principal_id,
+                                "details": payload.clone(),
+                            }),
+                            goal: None,
+                            owner_principal_id: Some(next_owner_principal_id),
+                            budget_context_ref: None,
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status.clone(),
+                    current_status,
+                    applied_change,
+                )
+                .await
+            }
+            ControlSignalType::Terminate
+                if matches!(current_status, TaskStatus::Running | TaskStatus::Paused) =>
+            {
+                let applied_change = self
+                    .apply_status_change(
+                        tx,
+                        row,
+                        actor.clone(),
+                        StatusChange {
+                            to_status: TaskStatus::Cancelled,
+                            event_type: "task.cancelled",
+                            details: json!({
+                                "reason_code": "terminated_by_control_signal",
+                                "control_signal_id": signal_id,
+                                "requested_effect": "terminate",
+                                "details": payload.clone(),
+                            }),
+                            result_ref: row.result_ref.clone(),
+                            correlation_id: Some(correlation_id.to_owned()),
+                            causation_event_id: Some(received_event_id),
+                        },
+                    )
+                    .await?;
+
+                self.record_control_signal_applied(
+                    tx,
+                    row.task_id()?,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status,
+                    TaskStatus::Cancelled,
+                    applied_change,
+                )
+                .await
+            }
+            signal_type => {
+                self.record_control_signal_rejected(
+                    tx,
+                    row,
+                    actor,
+                    signal_id,
+                    signal_type,
+                    payload,
+                    correlation_id,
+                    received_event_id,
+                    current_status.clone(),
+                    current_state_version_ref,
+                    checkpoint_ref,
+                    if current_status.is_terminal() {
+                        "terminal_state_irreversible"
+                    } else {
+                        "illegal_transition"
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn record_control_signal_applied(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        task_id: Uuid,
+        actor: PrincipalAttribution,
+        signal_id: Uuid,
+        signal_type: ControlSignalType,
+        payload: Value,
+        correlation_id: &str,
+        received_event_id: Uuid,
+        current_status: TaskStatus,
+        status_after: TaskStatus,
+        applied_change: AppliedStatusChange,
+    ) -> Result<ControlSignalRecord> {
+        let updated_row = fetch_task_row(&mut **tx, task_id).await?;
+        let checkpoint_ref =
+            parse_optional_uuid("checkpoint_ref", updated_row.checkpoint_ref.clone())?;
+        let (approval_gate_id, blocked_call_id) = control_signal_linkage(&payload);
+        let outcome = self
+            .event_log
+            .append(
+                tx,
+                self.id_generator.as_ref(),
+                self.clock.as_ref(),
+                EventDraft {
+                    event_type: "control.signal.applied".to_owned(),
+                    event_family: EventFamily::Control,
+                    task_id,
+                    occurred_at: self.clock.now(),
+                    emitted_by: self.config.emitted_by.clone(),
+                    payload: json!({
+                        "signal_id": signal_id,
+                        "action": signal_type.as_str(),
+                        "issuer_principal_id": actor.principal_id,
+                        "requested_effect": signal_type.as_str(),
+                        "status_before": current_status.as_str(),
+                        "status_after": status_after.as_str(),
+                        "approval_gate_id": approval_gate_id,
+                        "blocked_call_id": blocked_call_id,
+                        "applied_event_type": applied_change.event.event_type,
+                    }),
+                    correlation_id: Some(correlation_id.to_owned()),
+                    causation_event_id: Some(received_event_id),
+                    principal: Some(actor),
+                    policy_context_ref: Some(updated_row.policy_context_ref.clone()),
+                    budget_context_ref: Some(updated_row.budget_context_ref.clone()),
+                    checkpoint_ref,
+                    state_version_ref: Some(applied_change.state_version_ref),
+                    evidence_ref: None,
+                    trace_ref: None,
+                    tenant_id: None,
+                },
+            )
+            .await?;
+
+        self.control_signal_store
+            .update_status(
+                tx,
+                signal_id,
+                ControlSignalStatus::Applied,
+                Some(outcome.recorded_at),
+                outcome.event_id,
+                outcome.sequence_number,
+            )
+            .await
+    }
+
+    async fn record_control_signal_deferred(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        row: &TaskRow,
+        actor: PrincipalAttribution,
+        signal_id: Uuid,
+        signal_type: ControlSignalType,
+        payload: Value,
+        correlation_id: &str,
+        received_event_id: Uuid,
+        current_status: TaskStatus,
+        current_state_version_ref: Uuid,
+        checkpoint_ref: Option<Uuid>,
+        reason_code: &'static str,
+    ) -> Result<ControlSignalRecord> {
+        let (approval_gate_id, blocked_call_id) = control_signal_linkage(&payload);
+        let outcome = self
+            .event_log
+            .append(
+                tx,
+                self.id_generator.as_ref(),
+                self.clock.as_ref(),
+                EventDraft {
+                    event_type: "control.signal.deferred".to_owned(),
+                    event_family: EventFamily::Control,
+                    task_id: row.task_id()?,
+                    occurred_at: self.clock.now(),
+                    emitted_by: self.config.emitted_by.clone(),
+                    payload: json!({
+                        "signal_id": signal_id,
+                        "action": signal_type.as_str(),
+                        "issuer_principal_id": actor.principal_id,
+                        "requested_effect": signal_type.as_str(),
+                        "status_before": current_status.as_str(),
+                        "approval_gate_id": approval_gate_id,
+                        "blocked_call_id": blocked_call_id,
+                        "reason_code": reason_code,
+                        "details": payload,
+                    }),
+                    correlation_id: Some(correlation_id.to_owned()),
+                    causation_event_id: Some(received_event_id),
+                    principal: Some(actor),
+                    policy_context_ref: Some(row.policy_context_ref.clone()),
+                    budget_context_ref: Some(row.budget_context_ref.clone()),
+                    checkpoint_ref,
+                    state_version_ref: Some(current_state_version_ref),
+                    evidence_ref: None,
+                    trace_ref: None,
+                    tenant_id: None,
+                },
+            )
+            .await?;
+
+        self.control_signal_store
+            .update_status(
+                tx,
+                signal_id,
+                ControlSignalStatus::Deferred,
+                None,
+                outcome.event_id,
+                outcome.sequence_number,
+            )
+            .await
+    }
+
+    async fn record_control_signal_rejected(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        row: &TaskRow,
+        actor: PrincipalAttribution,
+        signal_id: Uuid,
+        signal_type: ControlSignalType,
+        payload: Value,
+        correlation_id: &str,
+        received_event_id: Uuid,
+        current_status: TaskStatus,
+        current_state_version_ref: Uuid,
+        checkpoint_ref: Option<Uuid>,
+        reason_code: &'static str,
+    ) -> Result<ControlSignalRecord> {
+        let (approval_gate_id, blocked_call_id) = control_signal_linkage(&payload);
+        let outcome = self
+            .event_log
+            .append(
+                tx,
+                self.id_generator.as_ref(),
+                self.clock.as_ref(),
+                EventDraft {
+                    event_type: "control.signal.rejected".to_owned(),
+                    event_family: EventFamily::Control,
+                    task_id: row.task_id()?,
+                    occurred_at: self.clock.now(),
+                    emitted_by: self.config.emitted_by.clone(),
+                    payload: json!({
+                        "signal_id": signal_id,
+                        "action": signal_type.as_str(),
+                        "issuer_principal_id": actor.principal_id,
+                        "requested_effect": signal_type.as_str(),
+                        "status_before": current_status.as_str(),
+                        "approval_gate_id": approval_gate_id,
+                        "blocked_call_id": blocked_call_id,
+                        "reason_code": reason_code,
+                        "details": payload,
+                    }),
+                    correlation_id: Some(correlation_id.to_owned()),
+                    causation_event_id: Some(received_event_id),
+                    principal: Some(actor),
+                    policy_context_ref: Some(row.policy_context_ref.clone()),
+                    budget_context_ref: Some(row.budget_context_ref.clone()),
+                    checkpoint_ref,
+                    state_version_ref: Some(current_state_version_ref),
+                    evidence_ref: None,
+                    trace_ref: None,
+                    tenant_id: None,
+                },
+            )
+            .await?;
+
+        self.control_signal_store
+            .update_status(
+                tx,
+                signal_id,
+                ControlSignalStatus::Rejected,
+                None,
+                outcome.event_id,
+                outcome.sequence_number,
+            )
+            .await
     }
 
     async fn record_transition_rejection(
@@ -1111,6 +2458,25 @@ impl TaskManager {
         tx: &mut Transaction<'_, Sqlite>,
         principal_id: Uuid,
     ) -> Result<()> {
+        let Some(status) = self.principal_status_in_tx(tx, principal_id).await? else {
+            return Err(RuntimeError::PrincipalNotFound { principal_id });
+        };
+
+        if status != PrincipalStatus::Active {
+            return Err(RuntimeError::InvariantViolation(format!(
+                "principal {} is not active",
+                principal_id
+            )));
+        }
+
+        Ok(())
+    }
+
+    async fn principal_status_in_tx(
+        &self,
+        tx: &mut Transaction<'_, Sqlite>,
+        principal_id: Uuid,
+    ) -> Result<Option<PrincipalStatus>> {
         let status = sqlx::query_scalar::<_, String>(
             r#"
             SELECT status
@@ -1122,18 +2488,7 @@ impl TaskManager {
         .fetch_optional(&mut **tx)
         .await?;
 
-        let Some(status) = status else {
-            return Err(RuntimeError::PrincipalNotFound { principal_id });
-        };
-
-        if status.parse::<PrincipalStatus>()? != PrincipalStatus::Active {
-            return Err(RuntimeError::InvariantViolation(format!(
-                "principal {} is not active",
-                principal_id
-            )));
-        }
-
-        Ok(())
+        status.map(|value| value.parse()).transpose()
     }
 }
 
@@ -1272,4 +2627,68 @@ where
     .await?;
 
     Ok(latest)
+}
+
+fn control_signal_linkage(payload: &Value) -> (Option<String>, Option<String>) {
+    let approval_gate_id = payload
+        .get("approval_gate_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let blocked_call_id = payload
+        .get("blocked_call_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    (approval_gate_id, blocked_call_id)
+}
+
+fn control_signal_defer_requested(payload: &Value) -> bool {
+    payload
+        .get("unsafe_boundary")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn validate_waiting_on_control_resolution(
+    waiting_state: &TaskStateVersion,
+    payload: &Value,
+) -> std::result::Result<(Option<String>, Option<String>), &'static str> {
+    let Some(details) = waiting_state.payload.get("details") else {
+        return Err("waiting_on_control_context_missing");
+    };
+
+    let required_gate_id = details.get("approval_gate_id").and_then(Value::as_str);
+    let required_blocked_call_id = details.get("blocked_call_id").and_then(Value::as_str);
+    let (requested_gate_id, requested_blocked_call_id) = control_signal_linkage(payload);
+
+    if let Some(required_gate_id) = required_gate_id {
+        match requested_gate_id.as_deref() {
+            Some(candidate) if candidate == required_gate_id => {}
+            Some(_) => return Err("approval_gate_mismatch"),
+            None => return Err("approval_gate_id_required"),
+        }
+    }
+
+    if let Some(required_blocked_call_id) = required_blocked_call_id {
+        if let Some(candidate) = requested_blocked_call_id.as_deref() {
+            if candidate != required_blocked_call_id {
+                return Err("blocked_call_mismatch");
+            }
+        }
+    }
+
+    Ok((
+        required_gate_id.map(str::to_owned).or(requested_gate_id),
+        required_blocked_call_id
+            .map(str::to_owned)
+            .or(requested_blocked_call_id),
+    ))
+}
+
+fn parse_control_target_principal_id(payload: &Value) -> Option<Uuid> {
+    let candidate = payload
+        .get("owner_principal_id")
+        .or_else(|| payload.get("assignee_principal_id"))
+        .or_else(|| payload.get("principal_id"))
+        .and_then(Value::as_str)?;
+    Uuid::parse_str(candidate).ok()
 }

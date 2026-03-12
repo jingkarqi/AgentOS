@@ -1,25 +1,31 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-AgentOS is a spec-first repository. Put normative design docs in `docs/`: foundation material in `docs/foundation/`, versioned specs in `docs/specs/`, conformance rules in `docs/conformance/`, reference-runtime notes in `docs/reference-runtime/`, and architecture or decision records alongside them. Store machine-readable contracts in `schemas/` by domain, for example `schemas/budgets/budget-context.schema.json`. Keep executable or future runtime assets under `runtime/`. Use `tests/conformance/` for conformance cases and `tests/fixtures/` for sample payloads or replay data. `FIX_DECLARATIONS/` is for targeted repository-wide fix notes, not long-term specs.
+AgentOS is still spec-first, but it now also contains a committed Rust reference runtime. Put normative design docs in `docs/`: foundation material in `docs/foundation/`, domain specs under `docs/specs/` such as `kernel/`, `events/`, `budget/`, and `capabilities/`, conformance rules in `docs/conformance/`, reference-runtime notes in `docs/reference-runtime/`, and architecture or decision records in `docs/architecture/` and `docs/decisions/`. Store machine-readable contracts in `schemas/` by domain, including `budgets/`, `capabilities/`, `checkpoints/`, `controls/`, `events/`, and `tasks/`. Keep executable assets under `runtime/`; the current implementation lives in `runtime/mrr/` with Rust sources in `src/`, SQL migrations in `migrations/`, and runtime conformance coverage in `tests/runtime_conformance.rs`. Use `tests/conformance/` for spec-facing cases and `tests/fixtures/` for sample payloads or replay data. `FIX_DECLARATIONS/` is for targeted repo-wide fix notes, not durable normative specs.
 
 ## Build, Test, and Development Commands
-There is no committed `npm`, `make`, or compiled build workflow yet. Use lightweight validation commands while editing:
+Use small, non-interactive validation commands that match the area you changed:
 
-- `rg --files docs schemas tests runtime` to inspect the working set.
-- `python -m json.tool schemas/budgets/budget-context.schema.json` to verify JSON syntax before commit.
-- `git diff -- docs schemas tests runtime` to review only repository content relevant to a spec change.
+- `git status --short` to confirm the workspace state before and after edits.
+- `rg --files docs schemas tests runtime` to inspect the active working set quickly.
+- `python -m json.tool schemas/<domain>/<file>.schema.json` to verify schema JSON syntax.
+- `cargo test` from `runtime/mrr` to run the Rust runtime test suite.
+- `cargo test --test runtime_conformance` from `runtime/mrr` when touching conformance-sensitive runtime behavior.
+- `cargo fmt --check` from `runtime/mrr` to enforce Rust formatting before commit.
+- `git diff -- docs schemas tests runtime AGENTS.md` to review only repository content relevant to the change.
 
-If you add automation later, document it in the relevant directory `README.md` and keep commands non-interactive.
+When you add new automation, document it in the nearest `README.md` and keep commands reproducible and non-interactive.
 
 ## Coding Style & Naming Conventions
-Use Markdown with short sections, explicit headings, and direct normative language. Preserve versioned, kebab-case filenames such as `kernel-spec-v0.1.md` and `conformance-test-suite-v0.1.md`. Keep terminology aligned across specs; when a field is canonicalized, update `docs/specs/field-alignment-v0.1.md`. Format JSON schemas with two-space indentation, double-quoted keys, explicit `required` lists, and `additionalProperties: false` where the contract is closed.
+Use Markdown with short sections, explicit headings, and direct normative language. Preserve versioned, kebab-case filenames such as `kernel-spec-v0.1.md`, `event-schema-spec-v0.1.md`, and `conformance-test-suite-v0.1.md`. Keep terminology aligned across specs; when a field is canonicalized or renamed, update `docs/specs/field-alignment-v0.1.md` in the same change. Format JSON schemas with two-space indentation, double-quoted keys, explicit `required` lists, and `additionalProperties: false` where the contract is closed.
+
+For `runtime/mrr`, follow standard Rust conventions: snake_case modules, focused types, clear error propagation, and small functions around task, event, principal, checkpoint, and state semantics. Keep persistence changes paired with SQL migrations and avoid mixing unrelated refactors with normative behavior changes.
 
 ## Testing Guidelines
-Treat `docs/conformance/conformance-test-suite-v0.1.md` as the test oracle. Every new `MUST`-level rule should be backed by a conformance case or fixture update. Reuse suite case IDs in filenames or headings when possible, for example `CTS-01-task-lifecycle.json`. When a schema changes, verify at least one matching fixture and the affected spec section in the same change.
+Treat `docs/conformance/conformance-test-suite-v0.1.md` as the test oracle. Every new `MUST`-level rule should be backed by a conformance case, fixture, or runtime test update. Reuse suite case IDs in filenames or test names when possible, for example `CTS-01-task-lifecycle.json` or `cts_07_sequence_numbers_are_monotonic_and_gapless`. When a schema changes, verify at least one matching fixture and the affected spec section in the same change. When runtime behavior changes, run at minimum the focused `cargo test` target that covers the affected module, and prefer `runtime_conformance.rs` coverage for changes tied to spec guarantees.
 
 ## Commit & Pull Request Guidelines
-Current history uses scoped subjects such as `docs: 统一 v0.1 规范术语并添加预算上下文定义`. Follow the same pattern: `<scope>: <concise summary>`, with scopes like `docs`, `schemas`, `tests`, or `runtime`. Pull requests should state which spec areas changed, whether terminology or compatibility shifted, and what tests or fixtures were updated. Link the relevant issue or decision record when one exists. Screenshots are only useful for rendered diagrams or tables.
+Follow the existing scoped subject style: `<scope>: <concise summary>`, with scopes such as `docs`, `schemas`, `tests`, `runtime`, or `chore`. Keep commits narrowly scoped to one logical change. Pull requests should state which spec areas or runtime modules changed, whether terminology or compatibility shifted, what tests were run, and which fixtures or conformance cases were updated. Link the relevant issue or decision record when one exists. Screenshots are only useful for rendered diagrams or tables.
 
 ## Security & Configuration Tips
-Do not commit secrets, vendor credentials, or environment-specific tokens. Use synthetic IDs and sample data in schemas and fixtures. Keep vendor- or runtime-specific behavior clearly labeled as non-normative unless the spec explicitly standardizes it.
+Do not commit secrets, vendor credentials, or environment-specific tokens. Use synthetic IDs and sample data in schemas, migrations, and fixtures. Keep vendor- or runtime-specific behavior clearly labeled as non-normative unless the spec explicitly standardizes it. Do not commit Rust build artifacts from `runtime/mrr/target/` or Windows ADS files such as `*:Zone.Identifier`; those are already ignored and should stay out of reviews.

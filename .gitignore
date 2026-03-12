@@ -4,4 +4,7 @@
 # Windows alternate data stream artifacts
 *:Zone.Identifier
 
+# ignore reviews folder
+reviews/
+
 AGENTS.md

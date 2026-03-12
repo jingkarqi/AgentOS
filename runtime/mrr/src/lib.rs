@@ -2,6 +2,7 @@
 
 pub mod checkpoint_store;
 pub mod clock;
+pub mod control_signal;
 pub mod db;
 pub mod error;
 pub mod event_log;
@@ -14,10 +15,14 @@ pub use checkpoint_store::{CheckpointRecord, CheckpointStore};
 pub use clock::{
     Clock, DeterministicIdGenerator, FixedClock, IdGenerator, RandomIdGenerator, SystemClock,
 };
+pub use control_signal::{
+    ControlSignalRecord, ControlSignalStatus, ControlSignalStore, ControlSignalType,
+    NewControlSignalRecord, SubmitControlSignalCommand,
+};
 pub use db::RuntimeDb;
 pub use error::{Result, RuntimeError};
 pub use event_log::{EventDraft, EventEnvelope, EventFamily, EventLog};
 pub use principal::{Principal, PrincipalAttribution, PrincipalStatus, PrincipalStore};
 pub use state_store::{StateStore, StateVersionRef, TaskStateVersion};
 pub use task::{CreateTaskCommand, Task, TaskStatus};
-pub use task_manager::{TaskManager, TaskManagerConfig};
+pub use task_manager::{RequireApprovalCommand, TaskManager, TaskManagerConfig};

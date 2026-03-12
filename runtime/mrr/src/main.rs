@@ -31,6 +31,7 @@ enum Command {
 enum ShowTarget {
     Task { task_id: Uuid },
     Events { task_id: Uuid },
+    ControlSignals { task_id: Uuid },
 }
 
 #[tokio::main]
@@ -53,6 +54,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             ShowTarget::Events { task_id } => {
                 let events = manager.list_events_by_task(task_id).await?;
                 println!("{}", serde_json::to_string_pretty(&events)?);
+            }
+            ShowTarget::ControlSignals { task_id } => {
+                let control_signals = manager.list_control_signals_by_task(task_id).await?;
+                println!("{}", serde_json::to_string_pretty(&control_signals)?);
             }
         },
     }
